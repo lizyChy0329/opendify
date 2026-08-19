@@ -18,6 +18,10 @@ OpenDify 是一个将 Dify API 转换为 OpenAI API 格式的代理服务器。�
 - 支持Dify Agent应用，处理高级工具调用（如生成图片等）
 - 兼容标准的 OpenAI API 客户端
 - 自动获取 Dify 应用信息
+- **思考过程透传**：将 Dify 模型的思考过程（reasoning_content）与正文分离，兼容 OpenAI 推理模型客户端
+- **工具调用三格式解析**：自动识别并解析 JSON、XML、DSML（DeepSeek Markup Language）三种工具调用格式，转换为 OpenAI 原生 `tool_calls`
+- **工具调用双向代理**：支持工具结果（`role: tool`）回传，模型可基于工具输出继续推理
+- **流式输出性能优化**：同类型字符批量合并输出，显著降低 token 延迟
 
 ## 效果展示
 
@@ -93,6 +97,69 @@ CONVERSATION_MEMORY_MODE=1
 - 智能缓冲区管理
 - 动态延迟计算
 - 平滑的输出体验
+- 同类型字符批量合并输出，减少 SSE chunk 数量，降低感知延迟
+
+### 思考过程透传（reasoning_content）
+
+Dify 上游模型（如 DeepSeek 系列）的思考过程会以 ` thinking...` 标签包裹输出。OpenDify 自动识别并剥离思考标签，将思考内容放入 OpenAI 兼容的 `reasoning_content` 字段，正文保持纯净：
+
+```json
+{
+  "choices": [{
+    "delta": {
+      "reasoning_content": "用户想查看当前目录，需要调用 bash 工具...",
+      "content": ""
+    }
+  }]
+}
+```
+
+兼容支持 `reasoning_content` 的客户端（如 opencode、Cherry Studio 等），思考与正文分离展示。
+
+### 工具调用三格式解析
+
+Dify 上游模型可能以三种格式输出工具调用，OpenDify 自动识别并统一转换为 OpenAI 原生 `tool_calls`：
+
+1. **JSON 格式**（标准 OpenAI 风格）：
+```json
+{"tool_calls": [{"name": "bash", "arguments": {"command": "ls -la"}}]}
+```
+
+2. **XML 格式**（Anthropic 风格）：
+```xml
+<tool_calls>
+<invoke name="bash">
+<parameter name="command">ls -la</parameter>
+</invoke>
+</tool_calls>
+```
+
+3. **DSML 格式**（DeepSeek Markup Language，DeepSeek V3.2/V4 原生）：
+```
+<｜tool_calls｜>
+<｜invoke name="bash｜">
+<｜parameter name="command" string="true｜">ls -la</｜parameter｜>
+</｜invoke｜>
+</｜tool_calls｜>
+```
+
+DSML 解析特性：
+- 兼容全角竖线 `｜`（U+FF5C）与 ASCII 竖线 `|` 变体
+- 支持 `string="true|false"` 属性：`true` 按字面字符串取值，`false` 按 JSON 解码（数字/布尔/数组/对象）
+- 支持自闭合 `<invoke name="x"/>`（零参数工具）
+- 支持 Format 2：invoke 体内直接放置 JSON 对象
+- 兼容 V3.2 的 `function_calls` 根标签与 V4 的 `tool_calls` 根标签
+
+流式场景下，工具调用块会缓冲累积直到闭合标签出现才解析，未闭合时按普通文本输出，不会误判。
+
+### 工具调用双向代理
+
+OpenDify 完整支持 OpenAI 工具调用闭环：
+
+1. 客户端请求携带 `tools` 定义 → 自动注入系统提示词
+2. 模型输出工具调用（任意格式）→ 解析为原生 `tool_calls` + `finish_reason: "tool_calls"`
+3. 客户端执行工具后回传 `role: "tool"` 消息 → 透传给上游模型
+4. 模型基于工具结果继续推理 → 返回最终答案
 
 ### 配置灵活性
 
@@ -160,6 +227,60 @@ response = openai.ChatCompletion.create(
 
 for chunk in response:
     print(chunk.choices[0].delta.content or "", end="")
+```
+
+### 工具调用（Function Call）
+
+```python
+import openai
+
+openai.api_base = "http://127.0.0.1:5000/v1"
+openai.api_key = "sk-abc123"  # 使用配置的有效API Key
+
+response = openai.ChatCompletion.create(
+    model="My Translation App",
+    messages=[
+        {"role": "user", "content": "查看当前目录"}
+    ],
+    tools=[{
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "执行 bash 命令",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"}
+                },
+                "required": ["command"]
+            }
+        }
+    }],
+    stream=True
+)
+
+# 流式响应中会收到原生 tool_calls：
+# {"choices": [{"delta": {"tool_calls": [{"function": {"name": "bash", "arguments": "{\"command\": \"ls -la\"}"}}]}}]}
+# 最终 finish_reason 为 "tool_calls"
+```
+
+工具调用闭环：
+
+```python
+# 1. 模型返回 tool_calls（finish_reason="tool_calls"）
+# 2. 客户端执行工具
+# 3. 回传工具结果，模型继续推理
+messages.append({
+    "role": "tool",
+    "tool_call_id": "call_xxx_0",
+    "content": "total 292\ndrwxr-xr-x ..."
+})
+response = openai.ChatCompletion.create(
+    model="My Translation App",
+    messages=messages,
+    tools=tools,
+    stream=True
+)
 ```
 
 ## 快速开始

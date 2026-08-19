@@ -18,6 +18,10 @@ OpenDify is a proxy server that transforms the Dify API into OpenAI API format. 
 - Support for Dify Agent applications with advanced tool calls (like image generation)
 - Compatible with standard OpenAI API clients
 - Automatic fetching of Dify application information
+- **Reasoning content passthrough**: Separates the model's thinking process (`reasoning_content`) from the main content, compatible with OpenAI reasoning-model clients
+- **Three-format tool call parsing**: Automatically detects and parses JSON, XML, and DSML (DeepSeek Markup Language) tool call formats, converting them to native OpenAI `tool_calls`
+- **Bidirectional tool call proxying**: Supports tool results (`role: tool`) round-trip, allowing the model to continue reasoning based on tool output
+- **Streaming performance optimization**: Batches same-type characters for output, significantly reducing token latency
 
 ## Screenshots
 
@@ -97,6 +101,69 @@ Zero-width character mode is used by default. For scenarios that need to support
 - Intelligent buffer management
 - Dynamic delay calculation
 - Smooth output experience
+- Batches same-type characters into fewer SSE chunks, reducing perceived latency
+
+### Reasoning Content Passthrough (reasoning_content)
+
+Thinking processes from upstream models (e.g., DeepSeek series) are wrapped in ` thinking...` tags. OpenDify automatically detects and strips these tags, placing the thinking content into the OpenAI-compatible `reasoning_content` field while keeping the main content clean:
+
+```json
+{
+  "choices": [{
+    "delta": {
+      "reasoning_content": "The user wants to view the current directory, need to call the bash tool...",
+      "content": ""
+    }
+  }]
+}
+```
+
+Compatible with clients that support `reasoning_content` (e.g., opencode, Cherry Studio), displaying thinking and content separately.
+
+### Three-Format Tool Call Parsing
+
+Upstream models may output tool calls in three formats. OpenDify automatically detects and converts them all to native OpenAI `tool_calls`:
+
+1. **JSON format** (standard OpenAI style):
+```json
+{"tool_calls": [{"name": "bash", "arguments": {"command": "ls -la"}}]}
+```
+
+2. **XML format** (Anthropic style):
+```xml
+<tool_calls>
+<invoke name="bash">
+<parameter name="command">ls -la</parameter>
+</invoke>
+</tool_calls>
+```
+
+3. **DSML format** (DeepSeek Markup Language, native to DeepSeek V3.2/V4):
+```
+<｜tool_calls｜>
+<｜invoke name="bash｜">
+<｜parameter name="command" string="true｜">ls -la</｜parameter｜>
+</｜invoke｜>
+</｜tool_calls｜>
+```
+
+DSML parsing features:
+- Tolerates full-width vertical bar `｜` (U+FF5C) and ASCII `|` variants
+- Supports `string="true|false"` attribute: `true` takes literal string values, `false` decodes as JSON (numbers/booleans/arrays/objects)
+- Supports self-closing `<invoke name="x"/>` (zero-argument tools)
+- Supports Format 2: direct JSON object inside the invoke body
+- Compatible with both V3.2 `function_calls` root tag and V4 `tool_calls` root tag
+
+In streaming scenarios, tool call blocks are buffered until the closing tag appears before parsing; unclosed blocks are emitted as plain text without false positives.
+
+### Bidirectional Tool Call Proxying
+
+OpenDify fully supports the OpenAI tool call loop:
+
+1. Client request carries `tools` definitions → automatically injected into the system prompt
+2. Model outputs tool calls (any format) → parsed into native `tool_calls` + `finish_reason: "tool_calls"`
+3. Client executes the tool and returns a `role: "tool"` message → passed through to the upstream model
+4. Model continues reasoning based on tool results → returns the final answer
 
 ### Configuration Flexibility
 
@@ -164,6 +231,60 @@ response = openai.ChatCompletion.create(
 
 for chunk in response:
     print(chunk.choices[0].delta.content or "", end="")
+```
+
+### Tool Calls (Function Call)
+
+```python
+import openai
+
+openai.api_base = "http://127.0.0.1:5000/v1"
+openai.api_key = "sk-abc123"  # Use configured valid API key
+
+response = openai.ChatCompletion.create(
+    model="My Translation App",
+    messages=[
+        {"role": "user", "content": "List the current directory"}
+    ],
+    tools=[{
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "Execute a bash command",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"}
+                },
+                "required": ["command"]
+            }
+        }
+    }],
+    stream=True
+)
+
+# The streaming response will contain native tool_calls:
+# {"choices": [{"delta": {"tool_calls": [{"function": {"name": "bash", "arguments": "{\"command\": \"ls -la\"}"}}]}}]}
+# The final finish_reason will be "tool_calls"
+```
+
+Tool call loop:
+
+```python
+# 1. Model returns tool_calls (finish_reason="tool_calls")
+# 2. Client executes the tool
+# 3. Return the tool result, model continues reasoning
+messages.append({
+    "role": "tool",
+    "tool_call_id": "call_xxx_0",
+    "content": "total 292\ndrwxr-xr-x ..."
+})
+response = openai.ChatCompletion.create(
+    model="My Translation App",
+    messages=messages,
+    tools=tools,
+    stream=True
+)
 ```
 
 ## Quick Start

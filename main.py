@@ -1,6 +1,8 @@
 import json
 import logging
 import asyncio
+import codecs
+import re
 from flask import Flask, request, Response, stream_with_context, jsonify
 import httpx
 import time
@@ -211,6 +213,15 @@ async def transform_openai_to_dify(openai_request, endpoint, api_key=None):
             # 记录找到的system消息
             logger.info(f"Found system message: {system_content[:100]}{'...' if len(system_content) > 100 else ''}")
         
+        # 注入工具定义（双向工具代理协议）
+        tools_prompt = build_tools_prompt(openai_request.get("tools"))
+        if tools_prompt:
+            if system_content:
+                system_content = system_content + "\n\n" + tools_prompt
+            else:
+                system_content = tools_prompt
+            logger.info(f"Injected tools prompt ({len(tools_prompt)} chars) into system content")
+        
         # 处理用户消息，支持图片
         user_message = messages[-1] if messages and messages[-1].get("role") != "system" else {}
         user_content = user_message.get("content", "")
@@ -313,6 +324,26 @@ async def transform_openai_to_dify(openai_request, endpoint, api_key=None):
                 for msg in messages[:-1]:  # 除了最后一条消息
                     role = msg.get("role", "")
                     content = msg.get("content", "")
+                    
+                    # 工具执行结果消息：明确标记为工具结果
+                    if role == "tool":
+                        if isinstance(content, list):
+                            content = json.dumps(content, ensure_ascii=False)
+                        history_messages.append(f"工具执行结果: {content}")
+                        continue
+                    
+                    # assistant 消息带 tool_calls：记录模型调用过哪些工具
+                    if role == "assistant" and msg.get("tool_calls"):
+                        for tc in msg.get("tool_calls", []):
+                            fn = tc.get("function", {})
+                            name = fn.get("name", "")
+                            args = fn.get("arguments", "")
+                            if name:
+                                history_messages.append(f"模型请求调用工具: {name}({args})")
+                        if content:
+                            history_messages.append(f"assistant: {content}")
+                        continue
+                    
                     if role and content:
                         if role == "system":
                             has_system_in_history = True
@@ -346,7 +377,346 @@ async def transform_openai_to_dify(openai_request, endpoint, api_key=None):
     
     return None
 
-def transform_dify_to_openai(dify_response, model="claude-3-5-sonnet-v2", stream=False):
+def split_think(answer):
+    """将 <think>...</think> 思考过程与最终回答分离
+    返回 (thinking, content)
+    支持多个 think 块以及嵌套/未闭合标签的容错
+    """
+    if not answer:
+        return "", ""
+
+    # 提取所有 <think>...</think> 块（非贪婪，跨行）
+    think_pattern = re.compile(r'<think>(.*?)</think>', re.DOTALL)
+
+    thinking_parts = []
+    content_parts = []
+    last_end = 0
+    for m in think_pattern.finditer(answer):
+        # think 之前的文本属于内容
+        content_parts.append(answer[last_end:m.start()])
+        thinking_parts.append(m.group(1))
+        last_end = m.end()
+    # 剩余的文本属于内容
+    content_parts.append(answer[last_end:])
+
+    return "".join(thinking_parts), "".join(content_parts)
+
+
+def estimate_tokens(text):
+    """粗略估算 token 数（用于 usage 字段，不精确）"""
+    if not text:
+        return 0
+    # 中文字符大致 1 token/字，英文约 4 字符/token
+    cjk = len(re.findall(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af\u4e00-\u9fff]', text))
+    other = len(re.findall(r'[^\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af\s]', text))
+    return cjk + other // 4
+
+
+async def aggregate_streaming_response(client, dify_endpoint, dify_request, headers, model, openai_request):
+    """以 streaming 模式请求 Dify 并聚合为完整响应（用于 Agent 应用不支持 blocking 时的回退）"""
+    stream_request = {**dify_request, "response_mode": "streaming"}
+    answer_parts = []
+    message_id = ""
+    conversation_id = ""
+    decoder = codecs.getincrementaldecoder('utf-8')()
+    buffer = ""
+
+    async with client.stream(
+        'POST',
+        dify_endpoint,
+        json=stream_request,
+        headers={**headers, 'Accept': 'text/event-stream'}
+    ) as response:
+        if response.status_code != 200:
+            error_msg = f"Dify API error: {response.text}"
+            logger.error(f"Request failed: {error_msg}")
+            return {
+                "error": {
+                    "message": error_msg,
+                    "type": "api_error",
+                    "code": response.status_code
+                }
+            }, response.status_code
+
+        async for raw_bytes in response.aiter_raw():
+            if not raw_bytes:
+                continue
+            buffer += decoder.decode(raw_bytes)
+            while '\n' in buffer:
+                line, buffer = buffer.split('\n', 1)
+                line = line.strip()
+                if not line or not line.startswith('data: '):
+                    continue
+                try:
+                    dify_chunk = json.loads(line[6:])
+                except json.JSONDecodeError:
+                    continue
+                event = dify_chunk.get("event")
+                if event in ("message", "agent_message") and "answer" in dify_chunk:
+                    answer_parts.append(dify_chunk.get("answer", ""))
+                    if not message_id:
+                        message_id = dify_chunk.get("message_id", "")
+                elif event == "message_end":
+                    conversation_id = dify_chunk.get("conversation_id", "")
+                    if not message_id:
+                        message_id = dify_chunk.get("message_id", "")
+
+    answer = "".join(answer_parts)
+    thinking, answer = split_think(answer)
+
+    # 工具调用协议：解析 tool_calls JSON/XML
+    tool_calls = parse_tool_calls_any(answer)
+    if tool_calls is not None:
+        openai_tool_calls = to_openai_tool_calls(tool_calls, message_id)
+        message = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": openai_tool_calls
+        }
+        if thinking:
+            message["reasoning_content"] = thinking
+        openai_response = {
+            "id": message_id,
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": message,
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {
+                "prompt_tokens": estimate_tokens(json.dumps(openai_request, ensure_ascii=False)),
+                "completion_tokens": estimate_tokens(answer),
+                "total_tokens": estimate_tokens(json.dumps(openai_request, ensure_ascii=False)) + estimate_tokens(answer)
+            }
+        }
+        if conversation_id:
+            return Response(
+                json.dumps(openai_response),
+                content_type='application/json',
+                headers={'Conversation-Id': conversation_id}
+            )
+        return openai_response
+
+    message = {
+        "role": "assistant",
+        "content": answer
+    }
+    if thinking:
+        message["reasoning_content"] = thinking
+
+    openai_response = {
+        "id": message_id,
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": estimate_tokens(json.dumps(openai_request, ensure_ascii=False)),
+            "completion_tokens": estimate_tokens(answer),
+            "total_tokens": estimate_tokens(json.dumps(openai_request, ensure_ascii=False)) + estimate_tokens(answer)
+        }
+    }
+
+    if conversation_id:
+        return Response(
+            json.dumps(openai_response),
+            content_type='application/json',
+            headers={'Conversation-Id': conversation_id}
+        )
+    return openai_response
+
+
+def build_tools_prompt(tools):
+    """把 OpenAI tools 定义转为 Dify 模型可读的提示文本
+    要求模型在需要工具时只输出严格 JSON（供 OpenDify 解析为原生 tool_calls）
+    """
+    if not tools:
+        return ""
+    funcs = []
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        f = t.get("function", {}) if isinstance(t.get("function"), dict) else {}
+        if not f.get("name"):
+            continue
+        funcs.append({
+            "name": f.get("name", ""),
+            "description": f.get("description", ""),
+            "parameters": f.get("parameters", {})
+        })
+    if not funcs:
+        return ""
+    prompt = (
+        "以下是你可以调用的工具列表。当用户请求需要调用工具时，你的回答必须严格遵循如下格式：\n"
+        '{"tool_calls": [{"name": "<工具名>", "arguments": {<参数对象>}}]}\n'
+        "只输出这一个 JSON 对象，不要输出任何解释、代码块标记或其他文字。\n"
+        "严禁输出 <tool_calls> 或 <invoke> 之类的 XML 标签格式，只允许上述 JSON 格式。\n"
+        "不要自行编造工具结果，工具调用后用户会提供执行结果，你再基于结果继续回答。\n"
+        "可用工具：\n" + json.dumps(funcs, ensure_ascii=False, indent=2)
+    )
+    return prompt
+
+
+def parse_tool_calls(answer):
+    """从模型 answer 中解析 tool_calls JSON
+    成功返回 tool_calls 列表，失败返回 None
+    """
+    if not answer:
+        return None
+    text = answer.strip()
+    # 兼容 ```json ... ``` 代码块包裹
+    text = re.sub(r'^```(?:json)?\s*|\s*```$', '', text).strip()
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(obj, dict) and isinstance(obj.get("tool_calls"), list):
+        return obj["tool_calls"]
+    if isinstance(obj, list):
+        return obj
+    return None
+
+
+def _xml_unescape(text):
+    """反转义 XML 实体"""
+    return (text
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", '"')
+            .replace("&apos;", "'")
+            .replace("&amp;", "&"))
+
+
+def parse_tool_calls_xml(answer):
+    """从模型 answer 中解析 XML/DSML 风格 tool_calls
+    支持：
+    - 根标签 <tool_calls>（V4）或 <function_calls>（V3.2）
+    - <invoke name="x">...</invoke> 长格式
+    - <invoke name="x"/> 自闭合（零参数）
+    - <parameter name="k" string="true|false">v</parameter>
+    - Format 2: invoke 体内直接放 JSON 对象
+    成功返回 [{name, arguments: {...}}]，失败/未闭合返回 None
+    """
+    if not answer:
+        return None
+    text = answer.strip()
+    # 兼容 ```xml ... ``` 代码块包裹
+    text = re.sub(r'^```(?:xml)?\s*|\s*```$', '', text).strip()
+    # 必须包含完整的根标签闭合，否则视为未完成
+    if not (("<tool_calls>" in text and "</tool_calls>" in text) or
+            ("<function_calls>" in text and "</function_calls>" in text)):
+        return None
+    m = re.search(r'<(?:tool_calls|function_calls)>(.*?)</(?:tool_calls|function_calls)>', text, re.DOTALL)
+    if not m:
+        return None
+    body = m.group(1)
+    result = []
+    # 长格式 <invoke name="...">...</invoke>（容忍 name 后的其他属性）
+    for name, invoke_body in re.findall(r'<invoke\s+name="([^"]+)"[^>]*>(.*?)</invoke>', body, re.DOTALL):
+        name = name.strip()
+        if not name:
+            continue
+        args = _parse_invoke_body(invoke_body)
+        result.append({"name": name, "arguments": args})
+    # 自闭合 <invoke name="..."/>（零参数）
+    for name in re.findall(r'<invoke\s+name="([^"]+)"\s*/>', body):
+        name = name.strip()
+        if name:
+            result.append({"name": name, "arguments": {}})
+    return result if result else None
+
+
+def _parse_invoke_body(invoke_body):
+    """解析 invoke 体内参数：<parameter> 列表 或 Format 2 直接 JSON"""
+    invoke_body = invoke_body.strip()
+    # Format 2: invoke 体内直接放 JSON 对象
+    if invoke_body.startswith("{"):
+        try:
+            obj = json.loads(invoke_body)
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
+            pass
+    args = {}
+    # <parameter name="k" string="true|false">v</parameter>（属性顺序不固定）
+    for tag, pvalue in re.findall(r'<parameter\s+([^>]*)>(.*?)</parameter>', invoke_body, re.DOTALL):
+        name_m = re.search(r'name="([^"]+)"', tag)
+        if not name_m:
+            continue
+        pname = name_m.group(1).strip()
+        pvalue = _xml_unescape(pvalue.strip())
+        is_str = re.search(r'string="(true|false)"', tag)
+        if is_str and is_str.group(1) == "true":
+            # string="true" → 字面字符串，原样取值
+            args[pname] = pvalue
+        else:
+            # string="false" 或未标注 → 尝试 JSON 解码（数字/布尔/数组/对象），失败保留字符串
+            try:
+                args[pname] = json.loads(pvalue)
+            except (json.JSONDecodeError, ValueError):
+                args[pname] = pvalue
+    return args
+
+
+def restore_dsml(answer):
+    """还原 Dify DSML 编码：<＼＼DSML＼＼tagname> → <tagname>（＼＼ = \uff5c 全角反斜杠）"""
+    if not answer:
+        return answer
+    # 完整标记：＼＼DSML＼＼（全角反斜杠包裹）
+    marker = "\uff5c\uff5cDSML\uff5c\uff5c"
+    if marker in answer:
+        answer = answer.replace(marker, "")
+    # 兼容半角变体 \DSML\（部分版本）
+    marker2 = "\\DSML\\"
+    if marker2 in answer:
+        answer = answer.replace(marker2, "")
+    return answer
+
+
+def parse_tool_calls_any(answer):
+    """先试 JSON，再试 XML，兼容两种格式。入口先还原 Dify DSML 编码。"""
+    if not answer:
+        return None
+    answer = restore_dsml(answer)
+    parsed = parse_tool_calls(answer)
+    if parsed is not None:
+        return parsed
+    return parse_tool_calls_xml(answer)
+
+
+def to_openai_tool_calls(tool_calls, message_id):
+    """把 {name, arguments} 列表转成 OpenAI 原生 tool_calls 列表"""
+    result = []
+    prefix = (message_id or "call")[:8]
+    for i, tc in enumerate(tool_calls):
+        if isinstance(tc, str):
+            tc = {"name": tc}
+        if not isinstance(tc, dict):
+            continue
+        name = tc.get("name") or ""
+        args = tc.get("arguments", {})
+        if isinstance(args, str):
+            args_str = args
+        else:
+            args_str = json.dumps(args, ensure_ascii=False)
+        result.append({
+            "id": f"call_{prefix}_{i}",
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": args_str
+            }
+        })
+    return result
+
+
+def transform_dify_to_openai(dify_response, model="claude-3-5-sonnet-v2", stream=False, prompt_text=""):
     """将Dify格式的响应转换为OpenAI格式"""
     
     if not stream:
@@ -389,6 +759,43 @@ def transform_dify_to_openai(dify_response, model="claude-3-5-sonnet-v2", stream
                 answer = answer + encoded
                 logger.info(f"[Debug] Response content after insertion: {repr(answer)}")
         
+        # 剥离 <think> 思考过程，输出到 reasoning_content
+        thinking, answer = split_think(answer)
+        
+        # 工具调用协议：解析 tool_calls JSON/XML
+        tool_calls = parse_tool_calls_any(answer)
+        if tool_calls is not None:
+            message = {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": to_openai_tool_calls(tool_calls, dify_response.get("message_id", ""))
+            }
+            if thinking:
+                message["reasoning_content"] = thinking
+            return {
+                "id": dify_response.get("message_id", ""),
+                "object": "chat.completion",
+                "created": dify_response.get("created", int(time.time())),
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "message": message,
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": {
+                    "prompt_tokens": estimate_tokens(prompt_text),
+                    "completion_tokens": estimate_tokens(answer),
+                    "total_tokens": estimate_tokens(prompt_text) + estimate_tokens(answer)
+                }
+            }
+        
+        message = {
+            "role": "assistant",
+            "content": answer
+        }
+        if thinking:
+            message["reasoning_content"] = thinking
+        
         return {
             "id": dify_response.get("message_id", ""),
             "object": "chat.completion",
@@ -396,12 +803,14 @@ def transform_dify_to_openai(dify_response, model="claude-3-5-sonnet-v2", stream
             "model": model,
             "choices": [{
                 "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": answer
-                },
+                "message": message,
                 "finish_reason": "stop"
-            }]
+            }],
+            "usage": {
+                "prompt_tokens": estimate_tokens(prompt_text),
+                "completion_tokens": estimate_tokens(answer),
+                "total_tokens": estimate_tokens(prompt_text) + estimate_tokens(answer)
+            }
         }
     else:
         # 流式响应的转换在stream_response函数中处理
@@ -617,8 +1026,9 @@ def chat_completions():
         }
 
         stream = openai_request.get("stream", False)
+        has_tools = bool(openai_request.get("tools"))
         dify_endpoint = f"{DIFY_API_BASE}/chat-messages"
-        logger.info(f"Sending request to Dify endpoint: {dify_endpoint}, stream={stream}")
+        logger.info(f"Sending request to Dify endpoint: {dify_endpoint}, stream={stream}, has_tools={has_tools}")
 
         if stream:
             def generate():
@@ -634,16 +1044,28 @@ def chat_completions():
                     buffer_size: 缓冲区中剩余的字符数量
                     """
                     if buffer_size > 30:  # 缓冲区内容较多，快速输出
-                        return 0.001  # 5ms延迟
+                        return 0.0005  # 0.5ms延迟
                     elif buffer_size > 20:  # 中等数量，适中速度
-                        return 0.002  # 10ms延迟
+                        return 0.001  # 1ms延迟
                     elif buffer_size > 10:  # 较少内容，稍慢速度
-                        return 0.01  # 20ms延迟
+                        return 0.002  # 2ms延迟
                     else:  # 内容很少，使用较慢的速度
-                        return 0.02  # 30ms延迟
+                        return 0.003  # 3ms延迟
                 
-                def send_char(char, message_id):
-                    """Helper function to send single character"""
+                def send_char(chars, message_id, is_think=False):
+                    """Helper function to send characters (batch)
+                    is_think=True 时内容输出到 reasoning_content（思考过程）
+                    chars 可以是单个字符或字符串
+                    """
+                    delta = {}
+                    # 首个 chunk 带上 role，符合 OpenAI 流式规范
+                    if not send_char.role_sent:
+                        delta["role"] = "assistant"
+                        send_char.role_sent = True
+                    if is_think:
+                        delta["reasoning_content"] = chars
+                    else:
+                        delta["content"] = chars
                     openai_chunk = {
                         "id": message_id,
                         "object": "chat.completion.chunk",
@@ -651,15 +1073,36 @@ def chat_completions():
                         "model": model,
                         "choices": [{
                             "index": 0,
-                            "delta": {
-                                "content": char
-                            },
+                            "delta": delta,
                             "finish_reason": None
                         }]
                     }
                     chunk_data = f"data: {json.dumps(openai_chunk)}\n\n"
                     return flush_chunk(chunk_data)
-                
+                send_char.role_sent = False
+
+                # 思考标签状态机（处理跨片段到达的 <think> 标签）
+                THINK_OPEN = "<think>"
+                THINK_CLOSE = "</think>"
+                generate.in_think = False
+                generate.tag_buffer = ""
+
+                def process_think_char(char):
+                    """逐字符判定 <think> 标签，返回 (is_think, text) 或 None（标签字符）
+                    兼容标签跨多个 answer 片段到达的情况
+                    """
+                    target = THINK_CLOSE if generate.in_think else THINK_OPEN
+                    generate.tag_buffer += char
+                    if target.startswith(generate.tag_buffer):
+                        if generate.tag_buffer == target:
+                            generate.in_think = not generate.in_think
+                            generate.tag_buffer = ""
+                        return None  # 标签前缀，不输出
+                    # 不是标签，累积的字符按当前状态输出
+                    chars = generate.tag_buffer
+                    generate.tag_buffer = ""
+                    return (generate.in_think, chars)
+
                 # 初始化缓冲区
                 output_buffer = []
                 
@@ -677,13 +1120,20 @@ def chat_completions():
                     ) as response:
                         generate.message_id = None
                         buffer = ""
+                        decoder = codecs.getincrementaldecoder('utf-8')()
+                        # 工具调用协议状态
+                        generate.has_tools = has_tools
+                        generate.tool_calls_emitted = False
+                        generate.pending_tool_calls = []
+                        generate.tool_candidate = ""
                         
                         for raw_bytes in response.iter_raw():
                             if not raw_bytes:
                                 continue
                                 
                             try:
-                                buffer += raw_bytes.decode('utf-8')
+                                # 增量解码，避免多字节 UTF-8 字符被块边界切断
+                                buffer += decoder.decode(raw_bytes)
                                 
                                 while '\n' in buffer:
                                     line, buffer = buffer.split('\n', 1)
@@ -696,7 +1146,7 @@ def chat_completions():
                                         json_str = line[6:]
                                         dify_chunk = json.loads(json_str)
                                         
-                                        if dify_chunk.get("event") == "message" and "answer" in dify_chunk:
+                                        if dify_chunk.get("event") in ("message", "agent_message") and "answer" in dify_chunk:
                                             current_answer = dify_chunk["answer"]
                                             if not current_answer:
                                                 continue
@@ -705,39 +1155,43 @@ def chat_completions():
                                             if not generate.message_id:
                                                 generate.message_id = message_id
                                             
-                                            # 将当前批次的字符添加到输出缓冲区
+                                            # 逐字符经思考状态机处理后加入输出缓冲区
                                             for char in current_answer:
-                                                output_buffer.append((char, generate.message_id))
+                                                result = process_think_char(char)
+                                                if result is None:
+                                                    continue
+                                                is_think, chars = result
+                                                for c in chars:
+                                                    if generate.tool_calls_emitted and not is_think:
+                                                        # 已确认工具调用，丢弃 JSON 尾部 content 字符
+                                                        continue
+                                                    if generate.has_tools and not is_think:
+                                                        # 工具检测模式：累积候选 JSON/XML，不立即输出
+                                                        generate.tool_candidate += c
+                                                        tool_calls = parse_tool_calls_any(generate.tool_candidate)
+                                                        if tool_calls is not None:
+                                                            logger.info(f"Detected tool_calls: {json.dumps(tool_calls, ensure_ascii=False)}")
+                                                            generate.tool_calls_emitted = True
+                                                            generate.pending_tool_calls = to_openai_tool_calls(tool_calls, generate.message_id)
+                                                        else:
+                                                            # 候选明显不是 JSON/XML 开头 → 关闭检测，按普通文本输出
+                                                            cand = generate.tool_candidate.strip()
+                                                            if cand and not cand.startswith(("{", "[", "\"", "null", "true", "false", "<")):
+                                                                generate.has_tools = False
+                                                                for cc in generate.tool_candidate:
+                                                                    output_buffer.append((cc, generate.message_id, False))
+                                                                generate.tool_candidate = ""
+                                                        continue
+                                                    output_buffer.append((c, generate.message_id, is_think))
                                             
-                                            # 根据缓冲区大小动态调整输出速度
+                                            # 根据缓冲区大小动态调整输出速度（批量合并同类型字符）
                                             while output_buffer:
-                                                char, msg_id = output_buffer.pop(0)
-                                                yield send_char(char, msg_id)
-                                                # 根据剩余缓冲区大小计算延迟
-                                                delay = calculate_delay(len(output_buffer))
-                                                time.sleep(delay)
-                                            
-                                            # 立即继续处理下一个请求
-                                            continue
-                                        
-                                        # 处理Agent模式的消息事件
-                                        elif dify_chunk.get("event") == "agent_message" and "answer" in dify_chunk:
-                                            current_answer = dify_chunk["answer"]
-                                            if not current_answer:
-                                                continue
-                                                
-                                            message_id = dify_chunk.get("message_id", "")
-                                            if not generate.message_id:
-                                                generate.message_id = message_id
-                                            
-                                            # 将当前批次的字符添加到输出缓冲区
-                                            for char in current_answer:
-                                                output_buffer.append((char, generate.message_id))
-                                            
-                                            # 根据缓冲区大小动态调整输出速度
-                                            while output_buffer:
-                                                char, msg_id = output_buffer.pop(0)
-                                                yield send_char(char, msg_id)
+                                                c, msg_id, is_think = output_buffer.pop(0)
+                                                batch = [c]
+                                                # 合并后续同类型字符，减少 chunk 数量
+                                                while output_buffer and output_buffer[0][2] == is_think:
+                                                    batch.append(output_buffer.pop(0)[0])
+                                                yield send_char("".join(batch), msg_id, is_think)
                                                 # 根据剩余缓冲区大小计算延迟
                                                 delay = calculate_delay(len(output_buffer))
                                                 time.sleep(delay)
@@ -778,11 +1232,67 @@ def chat_completions():
                                             continue
                                         
                                         elif dify_chunk.get("event") == "message_end":
-                                            # 快速输出剩余内容
+                                            # 处理流结束时未闭合的思考标签残留
+                                            if generate.tag_buffer:
+                                                chars = generate.tag_buffer
+                                                generate.tag_buffer = ""
+                                                for c in chars:
+                                                    output_buffer.append((c, generate.message_id, generate.in_think))
+                                            
+                                            # 工具候选兜底：流结束时仍未确认
+                                            if generate.has_tools and not generate.tool_calls_emitted and generate.tool_candidate:
+                                                tool_calls = parse_tool_calls_any(generate.tool_candidate)
+                                                if tool_calls is not None:
+                                                    logger.info(f"Detected tool_calls at end: {json.dumps(tool_calls, ensure_ascii=False)}")
+                                                    generate.tool_calls_emitted = True
+                                                    generate.pending_tool_calls = to_openai_tool_calls(tool_calls, generate.message_id)
+                                                else:
+                                                    # 不是工具调用，按普通文本输出
+                                                    for cc in generate.tool_candidate:
+                                                        output_buffer.append((cc, generate.message_id, False))
+                                                    generate.tool_candidate = ""
+                                            
+                                            # 快速输出剩余内容（批量合并同类型字符）
                                             while output_buffer:
-                                                char, msg_id = output_buffer.pop(0)
-                                                yield send_char(char, msg_id)
+                                                c, msg_id, is_think = output_buffer.pop(0)
+                                                batch = [c]
+                                                while output_buffer and output_buffer[0][2] == is_think:
+                                                    batch.append(output_buffer.pop(0)[0])
+                                                yield send_char("".join(batch), msg_id, is_think)
                                                 time.sleep(0.001)  # 固定使用最小延迟快速输出剩余内容
+                                            
+                                            # 工具调用：输出 tool_calls chunks + finish_reason="tool_calls"
+                                            if generate.tool_calls_emitted and generate.pending_tool_calls:
+                                                for tc in generate.pending_tool_calls:
+                                                    tool_chunk = {
+                                                        "id": generate.message_id,
+                                                        "object": "chat.completion.chunk",
+                                                        "created": int(time.time()),
+                                                        "model": model,
+                                                        "choices": [{
+                                                            "index": 0,
+                                                            "delta": {
+                                                                "role": "assistant",
+                                                                "tool_calls": [tc]
+                                                            },
+                                                            "finish_reason": None
+                                                        }]
+                                                    }
+                                                    yield flush_chunk(f"data: {json.dumps(tool_chunk)}\n\n")
+                                                final_chunk = {
+                                                    "id": generate.message_id,
+                                                    "object": "chat.completion.chunk",
+                                                    "created": int(time.time()),
+                                                    "model": model,
+                                                    "choices": [{
+                                                        "index": 0,
+                                                        "delta": {},
+                                                        "finish_reason": "tool_calls"
+                                                    }]
+                                                }
+                                                yield flush_chunk(f"data: {json.dumps(final_chunk)}\n\n")
+                                                yield flush_chunk("data: [DONE]\n\n")
+                                                continue
                                             
                                             # 只在零宽字符会话记忆模式时处理conversation_id
                                             if CONVERSATION_MEMORY_MODE == 2:
@@ -852,6 +1362,13 @@ def chat_completions():
                         )
                         
                         if response.status_code != 200:
+                            # Agent 应用不支持 blocking 模式时，回退为 streaming 内部聚合
+                            if "does not support blocking mode" in response.text:
+                                logger.info("Blocking mode not supported, falling back to streaming aggregation")
+                                return await aggregate_streaming_response(
+                                    client, dify_endpoint, dify_request, headers,
+                                    model, openai_request
+                                )
                             error_msg = f"Dify API error: {response.text}"
                             logger.error(f"Request failed: {error_msg}")
                             return {
@@ -865,7 +1382,11 @@ def chat_completions():
                         dify_response = response.json()
                         logger.info(f"Received response from Dify: {json.dumps(dify_response, ensure_ascii=False)}")
                         logger.info(f"[Debug] Response content: {repr(dify_response.get('answer', ''))}")
-                        openai_response = transform_dify_to_openai(dify_response, model=model)
+                        openai_response = transform_dify_to_openai(
+                            dify_response,
+                            model=model,
+                            prompt_text=json.dumps(openai_request, ensure_ascii=False)
+                        )
                         conversation_id = dify_response.get("conversation_id")
                         if conversation_id:
                             # 在响应头中传递conversation_id
