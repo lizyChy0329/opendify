@@ -658,6 +658,8 @@ async def aggregate_streaming_response(client, dify_endpoint, dify_request, head
             )
         return openai_response
 
+    # 解析失败：剥离残留的工具调用 XML，防止原始标签泄漏到正文
+    answer = strip_tool_call_markup(answer)
     message = {
         "role": "assistant",
         "content": answer
@@ -756,6 +758,8 @@ def parse_tool_calls_xml(answer):
     """从模型 answer 中解析 XML/DSML 风格 tool_calls
     支持：
     - 根标签 <tool_calls>（V4）或 <function_calls>（V3.2）
+    - <antml:function_calls>/<antml:invoke>/<antml:parameter>（Anthropic 变体）
+    - 无根标签的裸 <invoke name="x">...</invoke> 与 <invoke name="x"/>
     - <invoke name="x">...</invoke> 长格式
     - <invoke name="x"/> 自闭合（零参数）
     - <parameter name="k" string="true|false">v</parameter>
@@ -767,14 +771,26 @@ def parse_tool_calls_xml(answer):
     text = answer.strip()
     # 兼容 ```xml ... ``` 代码块包裹
     text = re.sub(r'^```(?:xml)?\s*|\s*```$', '', text).strip()
-    # 必须包含完整的根标签闭合，否则视为未完成
-    if not (("<tool_calls>" in text and "</tool_calls>" in text) or
-            ("<function_calls>" in text and "</function_calls>" in text)):
+    # 归一化 antml 前缀：<antml:invoke> → <invoke> 等
+    text = re.sub(r'<(/?)\s*antml:', r'<\1', text)
+    # 根标签完整闭合时在根内提取；根标签已出现但未闭合 → 等待闭合（流式继续累积）；
+    # 无根标签 → 尝试提取裸 <invoke> 块
+    root_closed = (("<tool_calls>" in text and "</tool_calls>" in text) or
+                   ("<function_calls>" in text and "</function_calls>" in text))
+    root_open = "<tool_calls>" in text or "<function_calls>" in text
+    if root_closed:
+        m = re.search(r'<(?:tool_calls|function_calls)>(.*?)</(?:tool_calls|function_calls)>', text, re.DOTALL)
+        if not m:
+            return None
+        body = m.group(1)
+    elif root_open:
+        # 根标签已出现但未闭合 → 视为未完成（流式继续累积）
         return None
-    m = re.search(r'<(?:tool_calls|function_calls)>(.*?)</(?:tool_calls|function_calls)>', text, re.DOTALL)
-    if not m:
-        return None
-    body = m.group(1)
+    else:
+        # 存在 <invoke 开标签但无任何闭合 → 视为未完成（流式继续累积）
+        if "<invoke" in text and "</invoke>" not in text and "/>" not in text:
+            return None
+        body = text
     result = []
     # 长格式 <invoke name="...">...</invoke>（容忍 name 后的其他属性）
     for name, invoke_body in re.findall(r'<invoke\s+name="([^"]+)"[^>]*>(.*?)</invoke>', body, re.DOTALL):
@@ -860,6 +876,36 @@ def parse_tool_calls_any(answer):
     if parsed is not None:
         return parsed
     return parse_tool_calls_xml(answer)
+
+
+def strip_tool_call_markup(text):
+    """从文本中剥离未解析成功的工具调用 XML 标记（<invoke>/<tool_calls>/<function_calls>/<antml:*>/<parameter>），
+    仅保留正文。用于解析失败时防止原始 XML 泄漏到最终输出。"""
+    if not text:
+        return text or ""
+    text = restore_dsml(text)
+    text = re.sub(r'<(/?)\s*antml:', r'<\1', text)
+    # 循环删除闭合块（处理嵌套）
+    prev = None
+    while prev != text:
+        prev = text
+        text = re.sub(r'<(?:tool_calls|function_calls)\b[^>]*>.*?</(?:tool_calls|function_calls)>', '', text, flags=re.DOTALL)
+        text = re.sub(r'<invoke\s+name="[^"]*"[^>]*>.*?</invoke>', '', text, flags=re.DOTALL)
+        text = re.sub(r'<invoke\s+name="[^"]*"[^>]*?/>', '', text)
+        text = re.sub(r'<parameter\s+[^>]*>.*?</parameter>', '', text, flags=re.DOTALL)
+        text = re.sub(r'<parameter\s+[^>]*?/>', '', text)
+    # 悬空开标签：找到第一个未闭合的工具标签，从它截断到末尾（覆盖流被截断）
+    dangling = None
+    for m in re.finditer(r'<(invoke|tool_calls|function_calls)\b', text):
+        tag = m.group(1)
+        if not re.search(r'</' + tag + r'>', text[m.end():]):
+            dangling = m.start()
+            break
+    if dangling is not None:
+        text = text[:dangling]
+    # 收敛多余空行
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
 
 
 def to_openai_tool_calls(tool_calls, message_id):
@@ -962,6 +1008,8 @@ def transform_dify_to_openai(dify_response, model="claude-3-5-sonnet-v2", stream
                 }
             }
         
+        # 解析失败：剥离残留的工具调用 XML，防止原始标签泄漏到正文
+        answer = strip_tool_call_markup(answer)
         message = {
             "role": "assistant",
             "content": answer
@@ -1360,11 +1408,11 @@ def chat_completions():
                                                         if generate.tool_calls_emitted and not is_think:
                                                             # 已确认工具调用，丢弃 JSON 尾部 content 字符
                                                             continue
-                                                        if generate.has_tools and not is_think:
+                                                        if not is_think and (generate.has_tools or c == "<" or generate.tool_candidate.startswith("<")):
                                                             # 工具检测模式：累积候选 JSON/XML，不立即输出
                                                             generate.tool_candidate += c
                                                             tool_calls = parse_tool_calls_any(generate.tool_candidate)
-                                                            if tool_calls is not None:
+                                                            if tool_calls is not None and generate.has_tools:
                                                                 logger.info(f"Detected tool_calls: {json.dumps(tool_calls, ensure_ascii=False)}")
                                                                 generate.tool_calls_emitted = True
                                                                 generate.pending_tool_calls = to_openai_tool_calls(tool_calls, generate.message_id)
@@ -1373,8 +1421,10 @@ def chat_completions():
                                                                 cand = generate.tool_candidate.strip()
                                                                 if cand and not cand.startswith(("{", "[", "\"", "null", "true", "false", "<")):
                                                                     generate.has_tools = False
-                                                                    for cc in generate.tool_candidate:
-                                                                        output_buffer.append((cc, generate.message_id, False))
+                                                                    cleaned = strip_tool_call_markup(generate.tool_candidate)
+                                                                    if cleaned:
+                                                                        for cc in cleaned:
+                                                                            output_buffer.append((cc, generate.message_id, False))
                                                                     generate.tool_candidate = ""
                                                             continue
                                                         output_buffer.append((c, generate.message_id, is_think))
@@ -1441,16 +1491,18 @@ def chat_completions():
                                                         output_buffer.append((c, generate.message_id, generate.in_think))
                                             
                                                 # 工具候选兜底：流结束时仍未确认
-                                                if generate.has_tools and not generate.tool_calls_emitted and generate.tool_candidate:
+                                                if not generate.tool_calls_emitted and generate.tool_candidate:
                                                     tool_calls = parse_tool_calls_any(generate.tool_candidate)
-                                                    if tool_calls is not None:
+                                                    if tool_calls is not None and generate.has_tools:
                                                         logger.info(f"Detected tool_calls at end: {json.dumps(tool_calls, ensure_ascii=False)}")
                                                         generate.tool_calls_emitted = True
                                                         generate.pending_tool_calls = to_openai_tool_calls(tool_calls, generate.message_id)
                                                     else:
-                                                        # 不是工具调用，按普通文本输出
-                                                        for cc in generate.tool_candidate:
-                                                            output_buffer.append((cc, generate.message_id, False))
+                                                        # 不是工具调用（或未声明 tools）：剥离残留 XML 后按普通文本输出
+                                                        cleaned = strip_tool_call_markup(generate.tool_candidate)
+                                                        if cleaned:
+                                                            for cc in cleaned:
+                                                                output_buffer.append((cc, generate.message_id, False))
                                                         generate.tool_candidate = ""
                                             
                                                 # 快速输出剩余内容（批量合并同类型字符）
