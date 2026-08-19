@@ -665,18 +665,31 @@ def _parse_invoke_body(invoke_body):
 
 
 def restore_dsml(answer):
-    """还原 Dify DSML 编码：<＼＼DSML＼＼tagname> → <tagname>（＼＼ = \uff5c 全角反斜杠）"""
+    """归一化 DSML / Claude Code 竖线变体为标准 XML 标签。
+
+    DSML = DeepSeek Markup Language（DeepSeek V3.2/V4 原生工具调用标记），
+    分隔符为全角竖线 ｜（U+FF5C），存在多种降级/变体：
+    - 规范：<｜DSML｜tool_calls>（vLLM/SGLang）
+    - 双竖线：<||DSML||tool_calls>、<｜｜DSML｜｜tool_calls>
+    - Claude Code 风格：<｜tool_calls｜>、<｜invoke name="bash｜">、</｜invoke｜>
+    - ASCII：<|tool_calls|>
+
+    仅影响解析判断；解析失败时输出仍用原始候选，不会破坏普通文本。
+    """
     if not answer:
         return answer
-    # 完整标记：＼＼DSML＼＼（全角反斜杠包裹）
-    marker = "\uff5c\uff5cDSML\uff5c\uff5c"
-    if marker in answer:
-        answer = answer.replace(marker, "")
-    # 兼容半角变体 \DSML\（部分版本）
-    marker2 = "\\DSML\\"
-    if marker2 in answer:
-        answer = answer.replace(marker2, "")
-    return answer
+    text = answer
+    # 1. 移除 DSML 标记：<｜DSML｜tool_calls> → <tool_calls>（容忍 1-2 个全角/ASCII 竖线）
+    text = re.sub(r'[｜|]{1,2}DSML[｜|]{1,2}', '', text, flags=re.IGNORECASE)
+    # 2. 标签开始处竖线：<｜tool_calls → <tool_calls；</｜invoke → </invoke
+    text = re.sub(r'<(/?)[｜|]+', r'<\1', text)
+    # 3. 属性值竖线闭合（ASCII 版引号缺失，竖线取代 ">）：name="bash|> → name="bash">
+    text = re.sub(r'"([^"<>]*)[｜|]+>', r'"\1">', text)
+    # 4. 属性值内竖线（全角版引号闭合）：name="bash｜" → name="bash"
+    text = re.sub(r'"([^"<>]*)[｜|]+"', r'"\1"', text)
+    # 5. 标签结尾处竖线：tool_calls｜> → tool_calls>；</parameter｜> → </parameter>
+    text = re.sub(r'[｜|]+>', '>', text)
+    return text
 
 
 def parse_tool_calls_any(answer):
@@ -707,6 +720,7 @@ def to_openai_tool_calls(tool_calls, message_id):
             args_str = json.dumps(args, ensure_ascii=False)
         result.append({
             "id": f"call_{prefix}_{i}",
+            "index": i,
             "type": "function",
             "function": {
                 "name": name,
