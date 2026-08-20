@@ -33,6 +33,12 @@ VALID_API_KEYS = [key.strip() for key in os.getenv("VALID_API_KEYS", "").split("
 # 3: session-map 模式（session key -> Dify conversation_id 映射，上下文真正延续）
 CONVERSATION_MEMORY_MODE = int(os.getenv('CONVERSATION_MEMORY_MODE', '1'))
 
+# 上游请求超时配置（秒）
+# 超时后先发心跳包探活：心跳失败 → 快速失败(502)；心跳成功 → 重试一次，再超时 → 快速失败(504)
+UPSTREAM_CONNECT_TIMEOUT = float(os.getenv('UPSTREAM_CONNECT_TIMEOUT', '10'))
+UPSTREAM_READ_TIMEOUT = float(os.getenv('UPSTREAM_READ_TIMEOUT', '60'))
+UPSTREAM_HEARTBEAT_TIMEOUT = float(os.getenv('UPSTREAM_HEARTBEAT_TIMEOUT', '5'))
+
 # ================= session-map 会话延续组件 (MODE=3) =================
 # 三级回退 session key：X-Session-Id header -> 请求体 user 字段 -> 首条 user 消息 hash
 SESSION_MAP_TTL_HOURS = float(os.getenv('SESSION_MAP_TTL_HOURS', '24'))
@@ -181,7 +187,7 @@ class DifyModelManager:
     async def fetch_app_info(self, api_key):
         """获取Dify应用信息"""
         try:
-            async with httpx.AsyncClient(timeout=None) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(UPSTREAM_READ_TIMEOUT, connect=UPSTREAM_CONNECT_TIMEOUT)) as client:
                 headers = {
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json"
@@ -245,6 +251,37 @@ def get_api_key(model_name):
         logger.warning(f"No API key found for model: {model_name}")
     return api_key
 
+
+def upstream_heartbeat(api_key, timeout=UPSTREAM_HEARTBEAT_TIMEOUT):
+    """同步心跳探活：GET {DIFY_API_BASE}/info，200 视为上游存活（免费、不耗 token）"""
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            resp = client.get(
+                f"{DIFY_API_BASE}/info",
+                headers={"Authorization": f"Bearer {api_key}"},
+                params={"user": "heartbeat"}
+            )
+            return resp.status_code == 200
+    except Exception as e:
+        logger.warning(f"Heartbeat failed: {repr(e)}")
+        return False
+
+
+async def upstream_heartbeat_async(api_key, timeout=UPSTREAM_HEARTBEAT_TIMEOUT):
+    """异步心跳探活（阻塞路径用），逻辑同 upstream_heartbeat"""
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.get(
+                f"{DIFY_API_BASE}/info",
+                headers={"Authorization": f"Bearer {api_key}"},
+                params={"user": "heartbeat"}
+            )
+            return resp.status_code == 200
+    except Exception as e:
+        logger.warning(f"Heartbeat failed: {repr(e)}")
+        return False
+
+
 async def upload_image_to_dify(api_key, base64_data, user_id="default_user"):
     """上传图片到Dify并返回文件ID
     支持处理base64编码的图片数据，自动检测并提取有效的base64数据
@@ -267,7 +304,7 @@ async def upload_image_to_dify(api_key, base64_data, user_id="default_user"):
         
         try:
             # 使用httpx上传文件到Dify
-            async with httpx.AsyncClient(timeout=None) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(30, connect=UPSTREAM_CONNECT_TIMEOUT)) as client:
                 headers = {
                     "Authorization": f"Bearer {api_key}"
                 }
@@ -1259,7 +1296,7 @@ def chat_completions():
 
         if stream:
             def generate():
-                client = httpx.Client(timeout=None)
+                client = httpx.Client(timeout=httpx.Timeout(UPSTREAM_READ_TIMEOUT, connect=UPSTREAM_CONNECT_TIMEOUT))
                 
                 def flush_chunk(chunk_data):
                     """Helper function to flush chunks immediately"""
@@ -1336,202 +1373,241 @@ def chat_completions():
                 try:
                     # MODE=3: Dify 404 时丢弃失效 conversation_id，重建请求重试一次
                     current_request = dify_request
+                    timeout_retried = False
                     for _retry in range(2):
-                        with client.stream(
-                            'POST',
-                            dify_endpoint,
-                            json=current_request,
-                            headers={
-                                **headers,
-                                'Accept': 'text/event-stream',
-                                'Cache-Control': 'no-cache',
-                                'Connection': 'keep-alive'
-                            }
-                        ) as response:
-                            if response.status_code == 404 and session_key:
-                                if _retry == 0:
-                                    logger.warning(f"[session-map] Dify 404, dropping conversation_id for {session_key}")
-                                    session_map_pop(session_key)
-                                    current_request = asyncio.run(transform_openai_to_dify(
-                                        openai_request, "/chat/completions", api_key,
-                                        session_key=session_key, force_history_mode=True
-                                    ))
-                                    continue
-                                logger.error(f"[session-map] Dify 404 again after retry for {session_key}")
-                                yield flush_chunk(f"data: {json.dumps({'error': {'message': 'Dify conversation not found', 'type': 'api_error', 'code': 404}})}\\n\\n")
-                                yield flush_chunk("data: [DONE]\\n\\n")
-                                break
-                            generate.message_id = None
-                            buffer = ""
-                            decoder = codecs.getincrementaldecoder('utf-8')()
-                            # 工具调用协议状态
-                            generate.has_tools = has_tools
-                            generate.tool_calls_emitted = False
-                            generate.pending_tool_calls = []
-                            generate.tool_candidate = ""
+                        try:
+                            with client.stream(
+                                'POST',
+                                dify_endpoint,
+                                json=current_request,
+                                headers={
+                                    **headers,
+                                    'Accept': 'text/event-stream',
+                                    'Cache-Control': 'no-cache',
+                                    'Connection': 'keep-alive'
+                                }
+                            ) as response:
+                                if response.status_code == 404 and session_key:
+                                    if _retry == 0:
+                                        logger.warning(f"[session-map] Dify 404, dropping conversation_id for {session_key}")
+                                        session_map_pop(session_key)
+                                        current_request = asyncio.run(transform_openai_to_dify(
+                                            openai_request, "/chat/completions", api_key,
+                                            session_key=session_key, force_history_mode=True
+                                        ))
+                                        continue
+                                    logger.error(f"[session-map] Dify 404 again after retry for {session_key}")
+                                    yield flush_chunk(f"data: {json.dumps({'error': {'message': 'Dify conversation not found', 'type': 'api_error', 'code': 404}})}\\n\\n")
+                                    yield flush_chunk("data: [DONE]\\n\\n")
+                                    break
+                                generate.message_id = None
+                                buffer = ""
+                                decoder = codecs.getincrementaldecoder('utf-8')()
+                                # 工具调用协议状态
+                                generate.has_tools = has_tools
+                                generate.tool_calls_emitted = False
+                                generate.pending_tool_calls = []
+                                generate.tool_candidate = ""
                         
-                            for raw_bytes in response.iter_raw():
-                                if not raw_bytes:
-                                    continue
+                                for raw_bytes in response.iter_raw():
+                                    if not raw_bytes:
+                                        continue
                                 
-                                try:
-                                    # 增量解码，避免多字节 UTF-8 字符被块边界切断
-                                    buffer += decoder.decode(raw_bytes)
+                                    try:
+                                        # 增量解码，避免多字节 UTF-8 字符被块边界切断
+                                        buffer += decoder.decode(raw_bytes)
                                 
-                                    while '\n' in buffer:
-                                        line, buffer = buffer.split('\n', 1)
-                                        line = line.strip()
+                                        while '\n' in buffer:
+                                            line, buffer = buffer.split('\n', 1)
+                                            line = line.strip()
                                     
-                                        if not line or not line.startswith('data: '):
-                                            continue
+                                            if not line or not line.startswith('data: '):
+                                                continue
                                         
-                                        try:
-                                            json_str = line[6:]
-                                            dify_chunk = json.loads(json_str)
+                                            try:
+                                                json_str = line[6:]
+                                                dify_chunk = json.loads(json_str)
                                         
-                                            if dify_chunk.get("event") in ("message", "agent_message") and "answer" in dify_chunk:
-                                                current_answer = dify_chunk["answer"]
-                                                if not current_answer:
-                                                    continue
-                                                
-                                                message_id = dify_chunk.get("message_id", "")
-                                                if not generate.message_id:
-                                                    generate.message_id = message_id
-                                            
-                                                # 逐字符经思考状态机处理后加入输出缓冲区
-                                                for char in current_answer:
-                                                    result = process_think_char(char)
-                                                    if result is None:
+                                                if dify_chunk.get("event") in ("message", "agent_message") and "answer" in dify_chunk:
+                                                    current_answer = dify_chunk["answer"]
+                                                    if not current_answer:
                                                         continue
-                                                    is_think, chars = result
-                                                    for c in chars:
-                                                        if generate.tool_calls_emitted and not is_think:
-                                                            # 已确认工具调用，丢弃 JSON 尾部 content 字符
+                                                
+                                                    message_id = dify_chunk.get("message_id", "")
+                                                    if not generate.message_id:
+                                                        generate.message_id = message_id
+                                            
+                                                    # 逐字符经思考状态机处理后加入输出缓冲区
+                                                    for char in current_answer:
+                                                        result = process_think_char(char)
+                                                        if result is None:
                                                             continue
-                                                        if not is_think and (generate.has_tools or c == "<" or generate.tool_candidate.startswith("<")):
-                                                            # 工具检测模式：累积候选 JSON/XML，不立即输出
-                                                            generate.tool_candidate += c
-                                                            tool_calls = parse_tool_calls_any(generate.tool_candidate)
-                                                            if tool_calls is not None:
-                                                                logger.info(f"Detected tool_calls: {json.dumps(tool_calls, ensure_ascii=False)}")
-                                                                generate.tool_calls_emitted = True
-                                                                generate.pending_tool_calls = to_openai_tool_calls(tool_calls, generate.message_id)
-                                                            else:
-                                                                # 候选明显不是 JSON/XML 开头 → 关闭检测，按普通文本输出
-                                                                cand = generate.tool_candidate.strip()
-                                                                if cand and not cand.startswith(("{", "[", "\"", "null", "true", "false", "<")):
-                                                                    generate.has_tools = False
-                                                                    cleaned = strip_tool_call_markup(generate.tool_candidate)
-                                                                    if cleaned:
-                                                                        for cc in cleaned:
-                                                                            output_buffer.append((cc, generate.message_id, False))
-                                                                    generate.tool_candidate = ""
-                                                            continue
-                                                        output_buffer.append((c, generate.message_id, is_think))
+                                                        is_think, chars = result
+                                                        for c in chars:
+                                                            if generate.tool_calls_emitted and not is_think:
+                                                                # 已确认工具调用，丢弃 JSON 尾部 content 字符
+                                                                continue
+                                                            if not is_think and (generate.has_tools or c == "<" or generate.tool_candidate.startswith("<")):
+                                                                # 工具检测模式：累积候选 JSON/XML，不立即输出
+                                                                generate.tool_candidate += c
+                                                                tool_calls = parse_tool_calls_any(generate.tool_candidate)
+                                                                if tool_calls is not None:
+                                                                    logger.info(f"Detected tool_calls: {json.dumps(tool_calls, ensure_ascii=False)}")
+                                                                    generate.tool_calls_emitted = True
+                                                                    generate.pending_tool_calls = to_openai_tool_calls(tool_calls, generate.message_id)
+                                                                else:
+                                                                    # 候选明显不是 JSON/XML 开头 → 关闭检测，按普通文本输出
+                                                                    cand = generate.tool_candidate.strip()
+                                                                    if cand and not cand.startswith(("{", "[", "\"", "null", "true", "false", "<")):
+                                                                        generate.has_tools = False
+                                                                        cleaned = strip_tool_call_markup(generate.tool_candidate)
+                                                                        if cleaned:
+                                                                            for cc in cleaned:
+                                                                                output_buffer.append((cc, generate.message_id, False))
+                                                                        generate.tool_candidate = ""
+                                                                continue
+                                                            output_buffer.append((c, generate.message_id, is_think))
                                             
-                                                # 根据缓冲区大小动态调整输出速度（批量合并同类型字符）
-                                                while output_buffer:
-                                                    c, msg_id, is_think = output_buffer.pop(0)
-                                                    batch = [c]
-                                                    # 合并后续同类型字符，减少 chunk 数量
-                                                    while output_buffer and output_buffer[0][2] == is_think:
-                                                        batch.append(output_buffer.pop(0)[0])
-                                                    yield send_char("".join(batch), msg_id, is_think)
-                                                    # 根据剩余缓冲区大小计算延迟
-                                                    delay = calculate_delay(len(output_buffer))
-                                                    time.sleep(delay)
+                                                    # 根据缓冲区大小动态调整输出速度（批量合并同类型字符）
+                                                    while output_buffer:
+                                                        c, msg_id, is_think = output_buffer.pop(0)
+                                                        batch = [c]
+                                                        # 合并后续同类型字符，减少 chunk 数量
+                                                        while output_buffer and output_buffer[0][2] == is_think:
+                                                            batch.append(output_buffer.pop(0)[0])
+                                                        yield send_char("".join(batch), msg_id, is_think)
+                                                        # 根据剩余缓冲区大小计算延迟
+                                                        delay = calculate_delay(len(output_buffer))
+                                                        time.sleep(delay)
                                             
-                                                # 立即继续处理下一个请求
-                                                continue
+                                                    # 立即继续处理下一个请求
+                                                    continue
                                         
-                                            # 处理Agent的思考过程，记录日志但不输出给用户
-                                            elif dify_chunk.get("event") == "agent_thought":
-                                                thought_id = dify_chunk.get("id", "")
-                                                thought = dify_chunk.get("thought", "")
-                                                tool = dify_chunk.get("tool", "")
-                                                tool_input = dify_chunk.get("tool_input", "")
-                                                observation = dify_chunk.get("observation", "")
+                                                # 处理Agent的思考过程，记录日志但不输出给用户
+                                                elif dify_chunk.get("event") == "agent_thought":
+                                                    thought_id = dify_chunk.get("id", "")
+                                                    thought = dify_chunk.get("thought", "")
+                                                    tool = dify_chunk.get("tool", "")
+                                                    tool_input = dify_chunk.get("tool_input", "")
+                                                    observation = dify_chunk.get("observation", "")
                                             
-                                                logger.info(f"[Agent Thought] ID: {thought_id}, Tool: {tool}")
-                                                if thought:
-                                                    logger.info(f"[Agent Thought] Thought: {thought}")
-                                                if tool_input:
-                                                    logger.info(f"[Agent Thought] Tool Input: {tool_input}")
-                                                if observation:
-                                                    logger.info(f"[Agent Thought] Observation: {observation}")
+                                                    logger.info(f"[Agent Thought] ID: {thought_id}, Tool: {tool}")
+                                                    if thought:
+                                                        logger.info(f"[Agent Thought] Thought: {thought}")
+                                                    if tool_input:
+                                                        logger.info(f"[Agent Thought] Tool Input: {tool_input}")
+                                                    if observation:
+                                                        logger.info(f"[Agent Thought] Observation: {observation}")
                                             
-                                                # 获取message_id以关联思考和最终输出
-                                                message_id = dify_chunk.get("message_id", "")
-                                                if not generate.message_id and message_id:
-                                                    generate.message_id = message_id
+                                                    # 获取message_id以关联思考和最终输出
+                                                    message_id = dify_chunk.get("message_id", "")
+                                                    if not generate.message_id and message_id:
+                                                        generate.message_id = message_id
                                             
-                                                continue
+                                                    continue
                                         
-                                            # 处理消息中的文件(如图片)，记录日志但不直接输出给用户
-                                            elif dify_chunk.get("event") == "message_file":
-                                                file_id = dify_chunk.get("id", "")
-                                                file_type = dify_chunk.get("type", "")
-                                                file_url = dify_chunk.get("url", "")
+                                                # 处理消息中的文件(如图片)，记录日志但不直接输出给用户
+                                                elif dify_chunk.get("event") == "message_file":
+                                                    file_id = dify_chunk.get("id", "")
+                                                    file_type = dify_chunk.get("type", "")
+                                                    file_url = dify_chunk.get("url", "")
                                             
-                                                logger.info(f"[Message File] ID: {file_id}, Type: {file_type}, URL: {file_url}")
-                                                continue
+                                                    logger.info(f"[Message File] ID: {file_id}, Type: {file_type}, URL: {file_url}")
+                                                    continue
                                         
-                                            elif dify_chunk.get("event") == "message_end":
-                                                # MODE=3: 回写 conversation_id 到 session map
-                                                if CONVERSATION_MEMORY_MODE == 3 and session_key:
-                                                    cid = dify_chunk.get("conversation_id")
-                                                    if cid:
-                                                        session_map_set(session_key, cid)
-                                                        logger.info(f"[session-map] saved conversation_id={cid} for {session_key}")
-                                                # 处理流结束时未闭合的思考标签残留
-                                                if generate.tag_buffer:
-                                                    chars = generate.tag_buffer
-                                                    generate.tag_buffer = ""
-                                                    for c in chars:
-                                                        output_buffer.append((c, generate.message_id, generate.in_think))
+                                                elif dify_chunk.get("event") == "message_end":
+                                                    # MODE=3: 回写 conversation_id 到 session map
+                                                    if CONVERSATION_MEMORY_MODE == 3 and session_key:
+                                                        cid = dify_chunk.get("conversation_id")
+                                                        if cid:
+                                                            session_map_set(session_key, cid)
+                                                            logger.info(f"[session-map] saved conversation_id={cid} for {session_key}")
+                                                    # 处理流结束时未闭合的思考标签残留
+                                                    if generate.tag_buffer:
+                                                        chars = generate.tag_buffer
+                                                        generate.tag_buffer = ""
+                                                        for c in chars:
+                                                            output_buffer.append((c, generate.message_id, generate.in_think))
                                             
-                                                # 工具候选兜底：流结束时仍未确认
-                                                if not generate.tool_calls_emitted and generate.tool_candidate:
-                                                    tool_calls = parse_tool_calls_any(generate.tool_candidate)
-                                                    if tool_calls is not None:
-                                                        logger.info(f"Detected tool_calls at end: {json.dumps(tool_calls, ensure_ascii=False)}")
-                                                        generate.tool_calls_emitted = True
-                                                        generate.pending_tool_calls = to_openai_tool_calls(tool_calls, generate.message_id)
-                                                    else:
-                                                        # 不是工具调用：剥离残留 XML 后按普通文本输出
-                                                        cleaned = strip_tool_call_markup(generate.tool_candidate)
-                                                        if cleaned:
-                                                            for cc in cleaned:
-                                                                output_buffer.append((cc, generate.message_id, False))
-                                                        generate.tool_candidate = ""
+                                                    # 工具候选兜底：流结束时仍未确认
+                                                    if not generate.tool_calls_emitted and generate.tool_candidate:
+                                                        tool_calls = parse_tool_calls_any(generate.tool_candidate)
+                                                        if tool_calls is not None:
+                                                            logger.info(f"Detected tool_calls at end: {json.dumps(tool_calls, ensure_ascii=False)}")
+                                                            generate.tool_calls_emitted = True
+                                                            generate.pending_tool_calls = to_openai_tool_calls(tool_calls, generate.message_id)
+                                                        else:
+                                                            # 不是工具调用：剥离残留 XML 后按普通文本输出
+                                                            cleaned = strip_tool_call_markup(generate.tool_candidate)
+                                                            if cleaned:
+                                                                for cc in cleaned:
+                                                                    output_buffer.append((cc, generate.message_id, False))
+                                                            generate.tool_candidate = ""
                                             
-                                                # 快速输出剩余内容（批量合并同类型字符）
-                                                while output_buffer:
-                                                    c, msg_id, is_think = output_buffer.pop(0)
-                                                    batch = [c]
-                                                    while output_buffer and output_buffer[0][2] == is_think:
-                                                        batch.append(output_buffer.pop(0)[0])
-                                                    yield send_char("".join(batch), msg_id, is_think)
-                                                    time.sleep(0.001)  # 固定使用最小延迟快速输出剩余内容
+                                                    # 快速输出剩余内容（批量合并同类型字符）
+                                                    while output_buffer:
+                                                        c, msg_id, is_think = output_buffer.pop(0)
+                                                        batch = [c]
+                                                        while output_buffer and output_buffer[0][2] == is_think:
+                                                            batch.append(output_buffer.pop(0)[0])
+                                                        yield send_char("".join(batch), msg_id, is_think)
+                                                        time.sleep(0.001)  # 固定使用最小延迟快速输出剩余内容
                                             
-                                                # 工具调用：输出 tool_calls chunks + finish_reason="tool_calls"
-                                                if generate.tool_calls_emitted and generate.pending_tool_calls:
-                                                    for tc in generate.pending_tool_calls:
-                                                        tool_chunk = {
+                                                    # 工具调用：输出 tool_calls chunks + finish_reason="tool_calls"
+                                                    if generate.tool_calls_emitted and generate.pending_tool_calls:
+                                                        for tc in generate.pending_tool_calls:
+                                                            tool_chunk = {
+                                                                "id": generate.message_id,
+                                                                "object": "chat.completion.chunk",
+                                                                "created": int(time.time()),
+                                                                "model": model,
+                                                                "choices": [{
+                                                                    "index": 0,
+                                                                    "delta": {
+                                                                        "role": "assistant",
+                                                                        "tool_calls": [tc]
+                                                                    },
+                                                                    "finish_reason": None
+                                                                }]
+                                                            }
+                                                            yield flush_chunk(f"data: {json.dumps(tool_chunk)}\n\n")
+                                                        final_chunk = {
                                                             "id": generate.message_id,
                                                             "object": "chat.completion.chunk",
                                                             "created": int(time.time()),
                                                             "model": model,
                                                             "choices": [{
                                                                 "index": 0,
-                                                                "delta": {
-                                                                    "role": "assistant",
-                                                                    "tool_calls": [tc]
-                                                                },
-                                                                "finish_reason": None
+                                                                "delta": {},
+                                                                "finish_reason": "tool_calls"
                                                             }]
                                                         }
-                                                        yield flush_chunk(f"data: {json.dumps(tool_chunk)}\n\n")
+                                                        yield flush_chunk(f"data: {json.dumps(final_chunk)}\n\n")
+                                                        yield flush_chunk("data: [DONE]\n\n")
+                                                        continue
+                                            
+                                                    # 只在零宽字符会话记忆模式时处理conversation_id
+                                                    if CONVERSATION_MEMORY_MODE == 2:
+                                                        conversation_id = dify_chunk.get("conversation_id")
+                                                        history = dify_chunk.get("conversation_history", [])
+                                                
+                                                        has_conversation_id = False
+                                                        if history:
+                                                            for msg in history:
+                                                                if msg.get("role") == "assistant":
+                                                                    content = msg.get("content", "")
+                                                                    if decode_conversation_id(content) is not None:
+                                                                        has_conversation_id = True
+                                                                        break
+                                                
+                                                        # 只在新会话且历史消息中没有会话ID时插入
+                                                        if conversation_id and not has_conversation_id:
+                                                            logger.info(f"[Debug] Inserting conversation_id in stream: {conversation_id}")
+                                                            encoded = encode_conversation_id(conversation_id)
+                                                            logger.info(f"[Debug] Stream encoded content: {repr(encoded)}")
+                                                            for char in encoded:
+                                                                yield send_char(char, generate.message_id)
+                                            
                                                     final_chunk = {
                                                         "id": generate.message_id,
                                                         "object": "chat.completion.chunk",
@@ -1540,58 +1616,37 @@ def chat_completions():
                                                         "choices": [{
                                                             "index": 0,
                                                             "delta": {},
-                                                            "finish_reason": "tool_calls"
+                                                            "finish_reason": "stop"
                                                         }]
                                                     }
                                                     yield flush_chunk(f"data: {json.dumps(final_chunk)}\n\n")
                                                     yield flush_chunk("data: [DONE]\n\n")
-                                                    continue
-                                            
-                                                # 只在零宽字符会话记忆模式时处理conversation_id
-                                                if CONVERSATION_MEMORY_MODE == 2:
-                                                    conversation_id = dify_chunk.get("conversation_id")
-                                                    history = dify_chunk.get("conversation_history", [])
-                                                
-                                                    has_conversation_id = False
-                                                    if history:
-                                                        for msg in history:
-                                                            if msg.get("role") == "assistant":
-                                                                content = msg.get("content", "")
-                                                                if decode_conversation_id(content) is not None:
-                                                                    has_conversation_id = True
-                                                                    break
-                                                
-                                                    # 只在新会话且历史消息中没有会话ID时插入
-                                                    if conversation_id and not has_conversation_id:
-                                                        logger.info(f"[Debug] Inserting conversation_id in stream: {conversation_id}")
-                                                        encoded = encode_conversation_id(conversation_id)
-                                                        logger.info(f"[Debug] Stream encoded content: {repr(encoded)}")
-                                                        for char in encoded:
-                                                            yield send_char(char, generate.message_id)
-                                            
-                                                final_chunk = {
-                                                    "id": generate.message_id,
-                                                    "object": "chat.completion.chunk",
-                                                    "created": int(time.time()),
-                                                    "model": model,
-                                                    "choices": [{
-                                                        "index": 0,
-                                                        "delta": {},
-                                                        "finish_reason": "stop"
-                                                    }]
-                                                }
-                                                yield flush_chunk(f"data: {json.dumps(final_chunk)}\n\n")
-                                                yield flush_chunk("data: [DONE]\n\n")
                                         
-                                        except json.JSONDecodeError as e:
-                                            logger.error(f"JSON decode error: {str(e)}")
-                                            continue
+                                            except json.JSONDecodeError as e:
+                                                logger.error(f"JSON decode error: {str(e)}")
+                                                continue
                                         
-                                except Exception as e:
-                                    logger.error(f"Error processing chunk: {str(e)}")
-                                    continue
+                                    except Exception as e:
+                                        logger.error(f"Error processing chunk: {str(e)}")
+                                        continue
 
-                        break
+                            break
+                        except httpx.TransportError as e:
+                            # 上游超时/连接失败 → 心跳探活：心跳失败快速失败(502)，心跳成功重试一次，再超时快速失败(504)
+                            logger.error(f"Upstream transport error: {repr(e)}")
+                            if not upstream_heartbeat(api_key):
+                                logger.error("Heartbeat failed, upstream unreachable, failing fast")
+                                yield flush_chunk(f"data: {json.dumps({'error': {'message': 'upstream unreachable', 'type': 'api_error', 'code': 502}})}\\n\\n")
+                                yield flush_chunk("data: [DONE]\\n\\n")
+                                break
+                            if timeout_retried:
+                                logger.error("Retry timed out again, failing fast")
+                                yield flush_chunk(f"data: {json.dumps({'error': {'message': 'upstream timeout', 'type': 'api_error', 'code': 504}})}\\n\\n")
+                                yield flush_chunk("data: [DONE]\\n\\n")
+                                break
+                            timeout_retried = True
+                            logger.warning("Heartbeat OK, retrying request once")
+                            continue
                 finally:
                     client.close()
 
@@ -1608,15 +1663,41 @@ def chat_completions():
         else:
             async def sync_response():
                 try:
-                    async with httpx.AsyncClient(timeout=None) as client:
+                    async with httpx.AsyncClient(timeout=httpx.Timeout(UPSTREAM_READ_TIMEOUT, connect=UPSTREAM_CONNECT_TIMEOUT)) as client:
                         # MODE=3: Dify 404 时丢弃失效 conversation_id，重建请求重试一次
                         current_request = dify_request
+                        timeout_retried = False
                         for _retry in range(2):
-                            response = await client.post(
-                                dify_endpoint,
-                                json=current_request,
-                                headers=headers
-                            )
+                            try:
+                                response = await client.post(
+                                    dify_endpoint,
+                                    json=current_request,
+                                    headers=headers
+                                )
+                            except httpx.TransportError as e:
+                                # 上游超时/连接失败 → 心跳探活：心跳失败快速失败(502)，心跳成功重试一次，再超时快速失败(504)
+                                logger.error(f"Upstream transport error: {repr(e)}")
+                                if not await upstream_heartbeat_async(api_key):
+                                    logger.error("Heartbeat failed, upstream unreachable, failing fast")
+                                    return {
+                                        "error": {
+                                            "message": "upstream unreachable",
+                                            "type": "api_error",
+                                            "code": "upstream_unreachable"
+                                        }
+                                    }, 502
+                                if timeout_retried:
+                                    logger.error("Retry timed out again, failing fast")
+                                    return {
+                                        "error": {
+                                            "message": "upstream timeout",
+                                            "type": "api_error",
+                                            "code": "upstream_timeout"
+                                        }
+                                    }, 504
+                                timeout_retried = True
+                                logger.warning("Heartbeat OK, retrying request once")
+                                continue
                             if response.status_code == 404 and session_key:
                                 if _retry == 0:
                                     logger.warning(f"[session-map] Dify 404, dropping conversation_id for {session_key}")
