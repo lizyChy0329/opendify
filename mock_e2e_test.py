@@ -300,11 +300,16 @@ content, tcs, done = run_stream('partial', with_tools=True)
 check('<invoke' not in content and '<tool_calls' not in content, f'partial content 无 XML 泄漏: {content!r}')
 check(done, 'partial 流以 [DONE] 结束')
 
-# 流式：bare_xml 不带 tools → 无 XML 泄漏，无 tool_calls
+# 流式：bare_xml 不带 tools → 仍转原生 tool_calls，无 XML 泄漏
 content, tcs, done = run_stream('bare_xml', with_tools=False)
+check(tcs and tcs[0].get('function', {}).get('name') == 'bash', f'无 tools bare_xml 仍发出 tool_calls: {tcs}')
 check('<invoke' not in content and '</invoke>' not in content and '<tool_calls' not in content,
       f'无 tools content 无 XML 泄漏: {content!r}')
-check(not tcs, f'无 tools 不输出 tool_calls: {tcs}')
+
+# 流式：DSML 不带 tools（用户实际场景）→ 转原生 tool_calls
+content, tcs, done = run_stream('', with_tools=False)
+check(len(tcs) == 2, f'无 tools DSML 仍发出 2 个 tool_calls: {tcs}')
+check('<invoke' not in content and '<tool_calls' not in content, f'无 tools DSML content 无 XML 泄漏: {content!r}')
 
 # 非流式：blocking_xml（未闭合）→ 正文保留，无 XML
 resp = client.post('/v1/chat/completions',

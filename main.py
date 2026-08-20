@@ -1412,7 +1412,7 @@ def chat_completions():
                                                             # 工具检测模式：累积候选 JSON/XML，不立即输出
                                                             generate.tool_candidate += c
                                                             tool_calls = parse_tool_calls_any(generate.tool_candidate)
-                                                            if tool_calls is not None and generate.has_tools:
+                                                            if tool_calls is not None:
                                                                 logger.info(f"Detected tool_calls: {json.dumps(tool_calls, ensure_ascii=False)}")
                                                                 generate.tool_calls_emitted = True
                                                                 generate.pending_tool_calls = to_openai_tool_calls(tool_calls, generate.message_id)
@@ -1493,12 +1493,12 @@ def chat_completions():
                                                 # 工具候选兜底：流结束时仍未确认
                                                 if not generate.tool_calls_emitted and generate.tool_candidate:
                                                     tool_calls = parse_tool_calls_any(generate.tool_candidate)
-                                                    if tool_calls is not None and generate.has_tools:
+                                                    if tool_calls is not None:
                                                         logger.info(f"Detected tool_calls at end: {json.dumps(tool_calls, ensure_ascii=False)}")
                                                         generate.tool_calls_emitted = True
                                                         generate.pending_tool_calls = to_openai_tool_calls(tool_calls, generate.message_id)
                                                     else:
-                                                        # 不是工具调用（或未声明 tools）：剥离残留 XML 后按普通文本输出
+                                                        # 不是工具调用：剥离残留 XML 后按普通文本输出
                                                         cleaned = strip_tool_call_markup(generate.tool_candidate)
                                                         if cleaned:
                                                             for cc in cleaned:
